@@ -30,18 +30,20 @@ VAE_MODEL = MODELS_DIR / "vae" / "qwen_image_vae.safetensors"
 TRAIN_SCRIPT = SD_SCRIPTS_DIR / "anima_train_network.py"
 
 BASE_MODEL_URLS = {
-    "anima-preview": "https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/diffusion_models/anima-preview.safetensors",
+    "anima-base-v1.0" : "https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/diffusion_models/anima-base-v1.0.safetensors",
     "anima-preview3-base": "https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/diffusion_models/anima-preview3-base.safetensors",
+    "anima-preview": "https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/diffusion_models/anima-preview.safetensors"
 }
 
 
 def get_dit_model_path(base_model: str) -> Path:
     """Return the local Path for the selected base model's DiT weights."""
     filenames = {
+        "anima-base-v1.0": "anima-base-v1.0.safetensors",
         "anima-preview": "anima-preview.safetensors",
         "anima-preview3-base": "anima-preview3-base.safetensors",
     }
-    return MODELS_DIR / "dit" / filenames.get(base_model, "anima-preview.safetensors")
+    return MODELS_DIR / "dit" / filenames.get(base_model, "anima-base-v1.0.safetensors")
 
 CONFIGS_DIR.mkdir(exist_ok=True)
 LOGS_DIR.mkdir(exist_ok=True)
@@ -56,7 +58,7 @@ ACCELERATE_CONFIG = "app_configs/accelerate_gpu.yaml"
 DEFAULTS = {
     # Basic
     "project_name": "my_lora",
-    "base_model": "anima-preview",
+    "base_model": "anima-base-v1.0",
     "image_directory": "",
     "output_directory": "",
     "network_dim": 20,
@@ -675,8 +677,8 @@ def build_ui() -> gr.Blocks:
                     with gr.Row():
                         base_model_dropdown = gr.Dropdown(
                             label="Base Model",
-                            choices=["anima-preview", "anima-preview3-base"],
-                            value=cfg.get("base_model", "anima-preview"),
+                            choices=["anima-base-v1.0", "anima-preview3-base", "anima-preview"],
+                            value=cfg.get("base_model", "anima-base-v1.0"),
                             info="Select Base Model (Model will auto download when you click start training. this may take a few minutes but future runs will not need to download.)",
                         )
                     image_directory = gr.Textbox(

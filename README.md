@@ -14,7 +14,9 @@ A lightweight Gradio web app that wraps [kohya-ss/sd-scripts](https://github.com
 - 📋 Config persistence — all settings saved and reloaded automatically
 - 📡 Live log streaming — watch training progress in real time
 
-Based on the [citronlegacy/citron-colab-anima-lora-trainer](https://github.com/citronlegacy/citron-colab-anima-lora-trainer) Colab notebook.
+## Acknowledgements
+
+Shout out to [Aitrepreneur](https://www.youtube.com/@Aitrepreneur)! Thanks for mentioning my app in your YouTube videos. Years ago, your videos helped get me started with AI, so it’s an honor to be mentioned by you.
 
 ---
 
