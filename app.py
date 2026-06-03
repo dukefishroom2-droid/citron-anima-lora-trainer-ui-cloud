@@ -5,9 +5,12 @@ Anima LoRA Trainer — Local Gradio UI
 import json
 import math
 import os
+import re
 import shlex
+import shutil
 import subprocess
 import sys
+import zipfile
 from datetime import datetime
 from pathlib import Path
 
@@ -23,6 +26,9 @@ CONFIGS_DIR = ROOT / "configs"
 LOGS_DIR = ROOT / "logs"
 MODELS_DIR = ROOT / "models" / "anima"
 SD_SCRIPTS_DIR = ROOT / "sd-scripts"
+DATASETS_DIR = Path(os.environ.get("ANIMA_DATASETS_DIR", ROOT / "datasets")).expanduser()
+OUTPUTS_DIR = Path(os.environ.get("ANIMA_OUTPUTS_DIR", ROOT / "outputs")).expanduser()
+EXPORTS_DIR = Path(os.environ.get("ANIMA_EXPORTS_DIR", ROOT / "exports")).expanduser()
 
 DIT_MODEL = MODELS_DIR / "dit" / "anima-preview.safetensors"
 QWEN3_MODEL = MODELS_DIR / "text_encoder" / "qwen_3_06b_base.safetensors"
@@ -47,6 +53,9 @@ def get_dit_model_path(base_model: str) -> Path:
 
 CONFIGS_DIR.mkdir(exist_ok=True)
 LOGS_DIR.mkdir(exist_ok=True)
+DATASETS_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Project-local accelerate config — keeps use_cpu=false and mixed_precision=bf16
 # scoped to this app only. See configs/accelerate_gpu.yaml to change these.
@@ -180,6 +189,259 @@ def validate_dataset(image_dir: str) -> tuple[int, list[str], list[str]]:
         warnings.append(f"{len(missing)} image(s) are missing caption (.txt) files.")
 
     return len(image_files), missing, warnings
+
+
+# ---------------------------------------------------------------------------
+# Cloud dataset import helpers
+# ---------------------------------------------------------------------------
+
+def safe_slug(value: str, fallback: str = "dataset") -> str:
+    """Return a filesystem-friendly name for uploaded datasets and outputs."""
+    value = (value or "").strip()
+    value = re.sub(r"[^A-Za-z0-9._-]+", "_", value)
+    value = value.strip("._-")
+    return value or fallback
+
+
+def create_unique_dataset_dir(project_name: str) -> Path:
+    """Create a fresh dataset directory without overwriting prior uploads."""
+    slug = safe_slug(project_name, "dataset")
+    base = DATASETS_DIR / slug
+    if not base.exists():
+        base.mkdir(parents=True, exist_ok=True)
+        return base
+
+    suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = DATASETS_DIR / f"{slug}_{suffix}"
+    path.mkdir(parents=True, exist_ok=False)
+    return path
+
+
+def default_output_dir(project_name: str) -> Path:
+    path = OUTPUTS_DIR / safe_slug(project_name, "run")
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def uploaded_file_path(file_value) -> Path | None:
+    """Normalize Gradio file values across gradio 4/5 return shapes."""
+    if file_value is None:
+        return None
+    if isinstance(file_value, (str, Path)):
+        return Path(file_value)
+    if isinstance(file_value, dict):
+        for key in ("path", "name", "orig_name"):
+            if file_value.get(key):
+                return Path(file_value[key])
+    for attr in ("path", "name"):
+        value = getattr(file_value, attr, None)
+        if value:
+            return Path(value)
+    return None
+
+
+def uploaded_file_paths(file_values) -> list[Path]:
+    if file_values is None:
+        return []
+    if not isinstance(file_values, (list, tuple)):
+        file_values = [file_values]
+    return [p for p in (uploaded_file_path(v) for v in file_values) if p and p.exists()]
+
+
+def copy_uploaded_files(file_values, target_dir: Path) -> int:
+    """Copy uploaded image/caption files into a flat dataset directory."""
+    target_dir.mkdir(parents=True, exist_ok=True)
+    copied = 0
+    allowed_exts = IMAGE_EXTS | {".txt"}
+
+    for src in uploaded_file_paths(file_values):
+        if not src.is_file() or src.suffix.lower() not in allowed_exts:
+            continue
+        dest = target_dir / src.name
+        if dest.exists():
+            stem = dest.stem
+            suffix = dest.suffix
+            i = 2
+            while dest.exists():
+                dest = target_dir / f"{stem}_{i}{suffix}"
+                i += 1
+        shutil.copy2(src, dest)
+        copied += 1
+
+    return copied
+
+
+def safe_extract_zip(zip_path: Path, target_dir: Path) -> int:
+    """Extract a zip while blocking absolute paths and parent traversal."""
+    extracted = 0
+    target_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path) as zf:
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            normalized = info.filename.replace("\\", "/")
+            parts = [p for p in normalized.split("/") if p]
+            if (
+                not parts
+                or parts[0] == "__MACOSX"
+                or parts[-1] in {".DS_Store", "Thumbs.db"}
+                or any(part == ".." for part in parts)
+                or normalized.startswith("/")
+            ):
+                continue
+
+            dest = target_dir.joinpath(*parts)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(info) as src, open(dest, "wb") as out:
+                shutil.copyfileobj(src, out)
+            extracted += 1
+    return extracted
+
+
+def count_dataset_images(path: Path) -> tuple[int, int]:
+    files = [p for p in path.iterdir() if p.is_file()]
+    images = [p for p in files if p.suffix.lower() in IMAGE_EXTS]
+    captions = {p.stem for p in files if p.suffix.lower() == ".txt"}
+    matched = sum(1 for img in images if img.stem in captions)
+    return len(images), matched
+
+
+def find_best_dataset_dir(root: Path) -> Path:
+    """Choose the directory that looks most like a flat trainer dataset."""
+    best = root
+    best_score = (-1, -1)
+    for current, _, _ in os.walk(root):
+        current_path = Path(current)
+        images, matched = count_dataset_images(current_path)
+        score = (images, matched)
+        if score > best_score:
+            best = current_path
+            best_score = score
+    return best
+
+
+def summarize_import(project_name: str, dataset_dir: Path, scanned_dir: Path, output_dir: Path, action: str) -> str:
+    lines = [f"{action} complete."]
+    lines.append(f"Image Directory: {scanned_dir}")
+    lines.append(f"Output Directory: {output_dir}")
+    if scanned_dir != dataset_dir:
+        lines.append(f"Detected dataset folder inside: {dataset_dir}")
+
+    try:
+        n_images, missing, warnings = validate_dataset(str(scanned_dir))
+        lines.append(f"Images found: {n_images}")
+        if missing:
+            lines.append(f"Missing captions: {len(missing)}")
+        for warning in warnings:
+            lines.append(f"Warning: {warning}")
+    except Exception as e:
+        lines.append(f"Validation warning: {e}")
+
+    lines.append("")
+    lines.append("Paths have been copied into the Training tab.")
+    return "\n".join(lines)
+
+
+def create_cloud_paths(project_name: str) -> tuple[str, str, str]:
+    dataset_dir = DATASETS_DIR / safe_slug(project_name, "dataset")
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = default_output_dir(project_name)
+    status = (
+        "Cloud paths ready.\n"
+        f"Image Directory: {dataset_dir}\n"
+        f"Output Directory: {output_dir}"
+    )
+    return str(dataset_dir), str(output_dir), status
+
+
+def import_dataset_zip(project_name: str, zip_file):
+    zip_path = uploaded_file_path(zip_file)
+    if not zip_path or not zip_path.exists():
+        return gr.update(), gr.update(), "Upload a .zip file first."
+    if zip_path.suffix.lower() != ".zip":
+        return gr.update(), gr.update(), "The uploaded file must be a .zip."
+
+    dataset_dir = create_unique_dataset_dir(project_name)
+    output_dir = default_output_dir(project_name)
+    extracted = safe_extract_zip(zip_path, dataset_dir)
+    if extracted == 0:
+        return gr.update(), gr.update(), "The .zip did not contain usable files."
+
+    scanned_dir = find_best_dataset_dir(dataset_dir)
+    status = summarize_import(project_name, dataset_dir, scanned_dir, output_dir, "ZIP import")
+    return str(scanned_dir), str(output_dir), status
+
+
+def import_dataset_files(project_name: str, files):
+    uploaded = uploaded_file_paths(files)
+    if not uploaded:
+        return gr.update(), gr.update(), "Upload files or a folder first."
+
+    dataset_dir = create_unique_dataset_dir(project_name)
+    output_dir = default_output_dir(project_name)
+    copied = copy_uploaded_files(uploaded, dataset_dir)
+    if copied == 0:
+        return gr.update(), gr.update(), "No supported image or .txt files were uploaded."
+
+    status = summarize_import(project_name, dataset_dir, dataset_dir, output_dir, "File import")
+    return str(dataset_dir), str(output_dir), status
+
+
+def output_dir_from_text(output_directory: str) -> Path:
+    output_dir = Path((output_directory or "").strip()).expanduser()
+    if not str(output_dir):
+        raise ValueError("Output Directory is empty.")
+    if not output_dir.exists():
+        raise FileNotFoundError(f"Output Directory does not exist: {output_dir}")
+    if not output_dir.is_dir():
+        raise NotADirectoryError(f"Output Directory is not a folder: {output_dir}")
+    return output_dir
+
+
+def download_latest_lora(output_directory: str):
+    try:
+        output_dir = output_dir_from_text(output_directory)
+    except Exception as e:
+        return gr.update(value=None), str(e)
+
+    files = [p for p in output_dir.rglob("*.safetensors") if p.is_file()]
+    if not files:
+        return gr.update(value=None), f"No .safetensors files found in: {output_dir}"
+
+    latest = max(files, key=lambda p: p.stat().st_mtime)
+    size_mb = latest.stat().st_size / 1024 / 1024
+    status = f"Ready to download latest LoRA:\n{latest}\nSize: {size_mb:.1f} MB"
+    return str(latest), status
+
+
+def package_output_zip(project_name: str, output_directory: str):
+    try:
+        output_dir = output_dir_from_text(output_directory)
+    except Exception as e:
+        return gr.update(value=None), str(e)
+
+    files = [
+        p for p in output_dir.rglob("*")
+        if p.is_file() and not p.is_symlink()
+    ]
+    if not files:
+        return gr.update(value=None), f"No files found in: {output_dir}"
+
+    EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    zip_path = EXPORTS_DIR / f"{safe_slug(project_name, 'anima_lora')}_{stamp}.zip"
+
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for path in files:
+            zf.write(path, path.relative_to(output_dir))
+
+    size_mb = zip_path.stat().st_size / 1024 / 1024
+    status = (
+        f"Output ZIP ready:\n{zip_path}\n"
+        f"Files included: {len(files)}\n"
+        f"Size: {size_mb:.1f} MB"
+    )
+    return str(zip_path), status
 
 
 # ---------------------------------------------------------------------------
@@ -770,7 +1032,62 @@ def build_ui() -> gr.Blocks:
                 )
 
             # ================================================================
-            # TAB 2 — Advanced Settings
+            # TAB 2 - Cloud Files
+            # ================================================================
+            with gr.Tab("Cloud Files"):
+                gr.Markdown(
+                    "Upload your local dataset into this cloud machine, then use the generated paths in the Training tab."
+                )
+
+                with gr.Group():
+                    gr.Markdown("### Empty Folders")
+                    create_paths_btn = gr.Button("Create Cloud Paths", variant="secondary")
+
+                with gr.Group():
+                    gr.Markdown("### Upload ZIP")
+                    dataset_zip = gr.File(
+                        label="Dataset .zip",
+                        file_count="single",
+                        file_types=[".zip"],
+                        type="filepath",
+                    )
+                    import_zip_btn = gr.Button("Import ZIP", variant="primary")
+
+                with gr.Group():
+                    gr.Markdown("### Upload Folder Or Files")
+                    dataset_files = gr.File(
+                        label="Images and .txt captions",
+                        file_count="directory",
+                        file_types=["image", ".txt"],
+                        type="filepath",
+                    )
+                    import_files_btn = gr.Button("Import Uploaded Files", variant="secondary")
+
+                cloud_status = gr.Textbox(
+                    label="Cloud File Status",
+                    lines=12,
+                    interactive=False,
+                    show_copy_button=True,
+                )
+
+                with gr.Group():
+                    gr.Markdown("### Download Results")
+                    with gr.Row():
+                        download_latest_btn = gr.Button("Download Latest LoRA", variant="primary")
+                        package_output_btn = gr.Button("Package Output ZIP", variant="secondary")
+                    download_file = gr.File(
+                        label="Prepared Download",
+                        interactive=False,
+                    )
+                    export_status = gr.Textbox(
+                        label="Download Status",
+                        lines=8,
+                        interactive=False,
+                        show_copy_button=True,
+                    )
+
+            # ================================================================
+            # TAB 3 - Advanced Settings
             # ================================================================
             with gr.Tab("Advanced Settings"):
                 gr.Markdown(
@@ -934,6 +1251,36 @@ def build_ui() -> gr.Blocks:
         ]
 
         # ── Configure Training event ─────────────────────────────────────
+        create_paths_btn.click(
+            fn=create_cloud_paths,
+            inputs=[project_name],
+            outputs=[image_directory, output_directory, cloud_status],
+        )
+
+        import_zip_btn.click(
+            fn=import_dataset_zip,
+            inputs=[project_name, dataset_zip],
+            outputs=[image_directory, output_directory, cloud_status],
+        )
+
+        import_files_btn.click(
+            fn=import_dataset_files,
+            inputs=[project_name, dataset_files],
+            outputs=[image_directory, output_directory, cloud_status],
+        )
+
+        download_latest_btn.click(
+            fn=download_latest_lora,
+            inputs=[output_directory],
+            outputs=[download_file, export_status],
+        )
+
+        package_output_btn.click(
+            fn=package_output_zip,
+            inputs=[project_name, output_directory],
+            outputs=[download_file, export_status],
+        )
+
         configure_btn.click(
             fn=configure_training,
             inputs=basic_inputs + adv_inputs,
@@ -957,7 +1304,7 @@ def build_ui() -> gr.Blocks:
 if __name__ == "__main__":
     demo = build_ui()
     demo.launch(
-        server_name="127.0.0.1",
-        server_port=7860,
+        server_name=os.environ.get("GRADIO_SERVER_NAME", "127.0.0.1"),
+        server_port=int(os.environ.get("GRADIO_SERVER_PORT", "7860")),
         show_error=True,
     )
