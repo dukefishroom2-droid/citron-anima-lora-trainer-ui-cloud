@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+import signal
 import shlex
 import shutil
 import subprocess
@@ -738,87 +739,125 @@ def configure_training(
 
 
 # ---------------------------------------------------------------------------
-# Training runner (generator — streams logs live to Gradio)
+# Background training jobs
 # ---------------------------------------------------------------------------
 
-def start_training(
+JOB_STATE_FILE = LOGS_DIR / "active_training_job.json"
+
+
+def is_pid_alive(pid: int | None) -> bool:
+    if not pid:
+        return False
+    try:
+        pid_int = int(pid)
+    except (TypeError, ValueError):
+        return False
+
+    status_path = Path(f"/proc/{pid_int}/status")
+    if status_path.exists():
+        try:
+            for line in status_path.read_text(errors="ignore").splitlines():
+                if line.startswith("State:") and "\tZ" in line:
+                    return False
+        except Exception:
+            pass
+    try:
+        os.kill(pid_int, 0)
+        return True
+    except OSError:
+        return False
+
+
+def load_job_state() -> dict:
+    if not JOB_STATE_FILE.exists():
+        return {}
+    try:
+        with open(JOB_STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_job_state(state: dict):
+    with open(JOB_STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
+
+
+def read_log_tail(log_file: str | Path | None, max_chars: int = 24000) -> str:
+    if not log_file:
+        return ""
+    path = Path(log_file)
+    if not path.exists():
+        return ""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(size - max_chars, 0), os.SEEK_SET)
+            data = f.read()
+        return data.decode("utf-8", errors="ignore")
+    except Exception as e:
+        return f"Could not read log: {e}"
+
+
+def log_has_exit_marker(log_file: str | Path | None) -> bool:
+    return "Training process exited with code" in read_log_tail(log_file, max_chars=4000)
+
+
+def training_status_message(state: dict | None = None) -> str:
+    state = state or load_job_state()
+    if not state:
+        return "No background training job has been started in this app session."
+
+    pid = state.get("pid")
+    running = is_pid_alive(pid)
+    if running and log_has_exit_marker(state.get("log_file")):
+        running = False
+    lines = [
+        f"Job status: {'running' if running else 'not running'}",
+        f"PID: {pid}",
+        f"Project: {state.get('project_name', '')}",
+        f"Started: {state.get('started_at', '')}",
+        f"Log file: {state.get('log_file', '')}",
+        f"Output directory: {state.get('output_directory', '')}",
+    ]
+    if not running:
+        lines.append("If the log ends with 'Training process exited with code 0', the job completed successfully.")
+    return "\n".join(lines)
+
+
+def build_training_command(
     custom_config_path: str,
     gpu_index_choice: str,
     num_cpu_threads_per_process: int,
     base_model: str,
-):
-    """
-    Generator: yields growing log text as training runs.
-    Uses last generated configs unless custom_config_path is provided.
-    Saves log to ./logs/
-    """
-    log_lines: list[str] = []
-
-    def emit(line: str):
-        log_lines.append(line)
-        return "\n".join(log_lines)
-
-    # --- Auto-download DiT model if needed ---
-    dit_model = get_dit_model_path(base_model)
-    if not dit_model.exists():
-        url = BASE_MODEL_URLS.get(base_model)
-        if not url:
-            yield emit(f"❌ Unknown base model: {base_model}")
-            return
-        yield emit(f"⏳ Downloading base model '{base_model}'...")
-        yield emit(f"   This may take a few minutes. Future runs will skip this step.")
-        yield emit(f"   Destination: {dit_model}")
-        yield emit("")
-        os.makedirs(dit_model.parent, exist_ok=True)
-        try:
-            dl_proc = subprocess.Popen(
-                ["wget", "-c", "--show-progress", "-O", str(dit_model), url],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                universal_newlines=True,
-                bufsize=1,
-            )
-            for line in iter(dl_proc.stdout.readline, ""):
-                yield emit(line.rstrip("\n"))
-            dl_proc.wait()
-            if dl_proc.returncode != 0:
-                yield emit(f"❌ Download failed (exit code {dl_proc.returncode})")
-                return
-            yield emit(f"✓ Base model downloaded successfully.")
-            yield emit("")
-        except FileNotFoundError:
-            yield emit("❌ 'wget' not found. Install wget and try again.")
-            return
-
-    # --- Resolve config paths ---
+) -> tuple[list[str], dict, Path, dict, str]:
     saved_cfg = load_config()
+
+    dit_model = get_dit_model_path(base_model)
+    base_model_download_url = ""
+    if not dit_model.exists():
+        base_model_download_url = BASE_MODEL_URLS.get(base_model, "")
+        if not base_model_download_url:
+            raise FileNotFoundError(
+                f"Base model is missing and no download URL is known: {dit_model}"
+            )
 
     train_cfg = custom_config_path.strip() if custom_config_path.strip() else saved_cfg.get("last_train_config", "")
     dataset_cfg = saved_cfg.get("last_dataset_config", "")
 
     if not train_cfg:
-        yield emit("❌ No training config found. Run 'Configure Training' first, or provide a config path.")
-        return
+        raise ValueError("No training config found. Run 'Configure Training' first, or provide a config path.")
     if not Path(train_cfg).exists():
-        yield emit(f"❌ Training config not found: {train_cfg}")
-        return
+        raise FileNotFoundError(f"Training config not found: {train_cfg}")
     if not dataset_cfg:
-        yield emit("❌ No dataset config found. Run 'Configure Training' first.")
-        return
+        raise ValueError("No dataset config found. Run 'Configure Training' first.")
     if not Path(dataset_cfg).exists():
-        yield emit(f"❌ Dataset config not found: {dataset_cfg}")
-        return
-
-    # --- Validate sd-scripts ---
+        raise FileNotFoundError(f"Dataset config not found: {dataset_cfg}")
     if not TRAIN_SCRIPT.exists():
-        yield emit(f"❌ Training script not found: {TRAIN_SCRIPT}\nRun setup_for_linux.sh / setup_for_windows.bat first.")
-        return
+        raise FileNotFoundError(f"Training script not found: {TRAIN_SCRIPT}\nRun setup_for_linux.sh first.")
 
-    # --- Validate GPU ---
     gpu_idx = gpu_index_from_choice(gpu_index_choice)
-    yield emit(f"Using GPU index: {gpu_idx}")
-
-    # --- Build accelerate command ---
     threads = max(int(num_cpu_threads_per_process), 1)
     cmd = [
         "accelerate", "launch",
@@ -830,60 +869,127 @@ def start_training(
         "--dataset_config", dataset_cfg,
     ]
 
-    yield emit(f"Command: {' '.join(shlex.quote(c) for c in cmd)}")
-    yield emit("")
-
-    # --- Set up log file ---
     timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    project_name = saved_cfg.get("project_name", "run")
+    project_name = safe_slug(saved_cfg.get("project_name", "run"), "run")
     log_file_path = LOGS_DIR / f"{project_name}_{timestamp}.log"
 
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = gpu_idx
     env["PYTHONUNBUFFERED"] = "1"
+    env.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-    # --- Launch subprocess ---
+    state = {
+        "pid": None,
+        "project_name": saved_cfg.get("project_name", "run"),
+        "started_at": datetime.now().isoformat(timespec="seconds"),
+        "log_file": str(log_file_path),
+        "output_directory": saved_cfg.get("output_directory", ""),
+        "train_config": train_cfg,
+        "dataset_config": dataset_cfg,
+        "gpu_index": gpu_idx,
+        "command": " ".join(shlex.quote(c) for c in cmd),
+        "base_model_download_url": base_model_download_url,
+        "base_model_path": str(dit_model),
+    }
+    return cmd, env, log_file_path, state, gpu_idx
+
+
+def start_training(
+    custom_config_path: str,
+    gpu_index_choice: str,
+    num_cpu_threads_per_process: int,
+    base_model: str,
+) -> tuple[str, str]:
+    state = load_job_state()
+    if state and is_pid_alive(state.get("pid")):
+        return training_status_message(state), read_log_tail(state.get("log_file"))
+
     try:
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            universal_newlines=True,
-            bufsize=1,
-            env=env,
-            cwd=str(ROOT),
-            encoding="utf-8",
-            errors="ignore",
+        cmd, env, log_file_path, state, gpu_idx = build_training_command(
+            custom_config_path,
+            gpu_index_choice,
+            num_cpu_threads_per_process,
+            base_model,
         )
-    except FileNotFoundError:
-        yield emit("❌ 'accelerate' not found. Make sure the venv is activated and accelerate is installed.")
-        return
+    except Exception as e:
+        return f"Could not start training:\n{e}", ""
 
-    # --- Stream output ---
+    shell_cmd = " ".join(shlex.quote(c) for c in cmd)
     with open(log_file_path, "w", encoding="utf-8", errors="ignore") as log_f:
-        log_f.write(f"Command: {' '.join(cmd)}\n")
-        log_f.write(f"Started: {datetime.now().isoformat()}\n\n")
+        log_f.write(f"Command: {shell_cmd}\n")
+        log_f.write(f"Started: {datetime.now().isoformat(timespec='seconds')}\n")
+        log_f.write(f"Using GPU index: {gpu_idx}\n\n")
+        log_f.flush()
 
-        for line in iter(process.stdout.readline, ""):
-            line = line.rstrip("\n")
-            log_f.write(line + "\n")
-            log_f.flush()
-            yield emit(line)
+        if os.name == "nt":
+            process = subprocess.Popen(
+                cmd,
+                stdout=log_f,
+                stderr=subprocess.STDOUT,
+                env=env,
+                cwd=str(ROOT),
+            )
+        else:
+            prelude = ""
+            if state.get("base_model_download_url"):
+                model_path = shlex.quote(state["base_model_path"])
+                model_url = shlex.quote(state["base_model_download_url"])
+                prelude = (
+                    f"mkdir -p {shlex.quote(str(Path(state['base_model_path']).parent))}\n"
+                    f"if [ ! -f {model_path} ]; then\n"
+                    f"  echo Downloading base model to {model_path}\n"
+                    f"  wget -c --show-progress -O {model_path} {model_url}\n"
+                    "fi\n"
+                )
+            wrapped = (
+                "set -o pipefail\n"
+                f"cd {shlex.quote(str(ROOT))}\n"
+                f"{prelude}"
+                f"{shell_cmd}\n"
+                "exit_code=$?\n"
+                "printf '\\nTraining process exited with code %s\\n' \"$exit_code\"\n"
+                "exit \"$exit_code\"\n"
+            )
+            process = subprocess.Popen(
+                ["bash", "-lc", wrapped],
+                stdout=log_f,
+                stderr=subprocess.STDOUT,
+                env=env,
+                cwd=str(ROOT),
+                start_new_session=True,
+            )
 
-    exit_code = process.wait()
+    state["pid"] = process.pid
+    save_job_state(state)
+    return training_status_message(state), read_log_tail(log_file_path)
 
-    if exit_code == 0:
-        yield emit(f"\n✓ Training completed successfully!\nLoRA saved to: {saved_cfg.get('output_directory', 'output dir')}\nLog saved to: {log_file_path}")
-    else:
-        yield emit(f"\n✗ Training failed (exit code: {exit_code})\nLog saved to: {log_file_path}")
-        # OOM hint
-        try:
-            result = subprocess.run(["dmesg", "-T"], capture_output=True, text=True, timeout=5)
-            tail = "\n".join(result.stdout.splitlines()[-40:])
-            if any(t in tail for t in ("Out of memory", "Killed process", "oom_reaper", "OOM")):
-                yield emit("\n💡 OOM detected in kernel log. Try: network_dim=8 and/or resolution=512")
-        except Exception:
-            pass
+
+def refresh_training_log() -> tuple[str, str]:
+    state = load_job_state()
+    return training_status_message(state), read_log_tail(state.get("log_file") if state else None)
+
+
+def stop_training() -> tuple[str, str]:
+    state = load_job_state()
+    pid = state.get("pid") if state else None
+    if not is_pid_alive(pid):
+        return training_status_message(state), read_log_tail(state.get("log_file") if state else None)
+
+    try:
+        if os.name != "nt":
+            os.killpg(int(pid), signal.SIGTERM)
+        else:
+            os.kill(int(pid), signal.SIGTERM)
+    except Exception as e:
+        return f"Could not stop PID {pid}: {e}", read_log_tail(state.get("log_file"))
+
+    log_file = state.get("log_file")
+    try:
+        with open(log_file, "a", encoding="utf-8", errors="ignore") as log_f:
+            log_f.write("\nStop requested from Gradio UI.\n")
+    except Exception:
+        pass
+    return "Stop requested. Refresh the log in a few seconds.", read_log_tail(log_file)
 
 
 # ---------------------------------------------------------------------------
@@ -1009,6 +1115,8 @@ def build_ui() -> gr.Blocks:
                 with gr.Row():
                     configure_btn = gr.Button("⚙️ Configure Training", variant="secondary", size="lg")
                     train_btn = gr.Button("🚀 Start Training", variant="primary", size="lg")
+                    refresh_log_btn = gr.Button("Refresh Log", variant="secondary", size="lg")
+                    stop_train_btn = gr.Button("Stop Training", variant="stop", size="lg")
 
                 custom_config_input = gr.Textbox(
                     label="Override Training Config Path (optional — leave blank to use last generated)",
@@ -1021,6 +1129,14 @@ def build_ui() -> gr.Blocks:
                     lines=12,
                     interactive=False,
                     show_copy_button=True,
+                )
+
+                job_status_box = gr.Textbox(
+                    label="Background Job Status",
+                    lines=7,
+                    interactive=False,
+                    show_copy_button=True,
+                    value=training_status_message(),
                 )
 
                 log_box = gr.Textbox(
@@ -1291,7 +1407,19 @@ def build_ui() -> gr.Blocks:
         train_btn.click(
             fn=start_training,
             inputs=[custom_config_input, gpu_dropdown, num_cpu_threads, base_model_dropdown],
-            outputs=[log_box],
+            outputs=[job_status_box, log_box],
+        )
+
+        refresh_log_btn.click(
+            fn=refresh_training_log,
+            inputs=[],
+            outputs=[job_status_box, log_box],
+        )
+
+        stop_train_btn.click(
+            fn=stop_training,
+            inputs=[],
+            outputs=[job_status_box, log_box],
         )
 
     return demo
