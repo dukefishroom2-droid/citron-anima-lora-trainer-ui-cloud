@@ -249,13 +249,76 @@ def uploaded_file_paths(file_values) -> list[Path]:
     return [p for p in (uploaded_file_path(v) for v in file_values) if p and p.exists()]
 
 
-def copy_uploaded_files(file_values, target_dir: Path) -> int:
+def format_bytes(num_bytes: int | float) -> str:
+    value = float(num_bytes or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024
+    return f"{value:.1f} TB"
+
+
+def summarize_uploaded_zip(zip_file) -> str:
+    zip_path = uploaded_file_path(zip_file)
+    if not zip_path or not zip_path.exists():
+        return "No ZIP uploaded."
+    if zip_path.suffix.lower() != ".zip":
+        return f"Upload received, but it is not a .zip:\n{zip_path.name}"
+
+    try:
+        size = zip_path.stat().st_size
+        with zipfile.ZipFile(zip_path) as zf:
+            files = [info for info in zf.infolist() if not info.is_dir()]
+            images = [info for info in files if Path(info.filename).suffix.lower() in IMAGE_EXTS]
+            captions = [info for info in files if Path(info.filename).suffix.lower() == ".txt"]
+            uncompressed = sum(info.file_size for info in files)
+    except Exception as e:
+        return f"ZIP upload received, but it could not be inspected:\n{zip_path}\n{e}"
+
+    return (
+        "ZIP upload received.\n"
+        f"File: {zip_path.name}\n"
+        f"Uploaded size: {format_bytes(size)}\n"
+        f"Files inside: {len(files)}\n"
+        f"Images inside: {len(images)}\n"
+        f"Captions inside: {len(captions)}\n"
+        f"Uncompressed size: {format_bytes(uncompressed)}\n\n"
+        "Ready to import."
+    )
+
+
+def summarize_uploaded_files(files) -> str:
+    uploaded = uploaded_file_paths(files)
+    if not uploaded:
+        return "No files uploaded."
+
+    file_count = len(uploaded)
+    image_count = sum(1 for p in uploaded if p.suffix.lower() in IMAGE_EXTS)
+    caption_count = sum(1 for p in uploaded if p.suffix.lower() == ".txt")
+    other_count = file_count - image_count - caption_count
+    total_size = sum(p.stat().st_size for p in uploaded if p.is_file())
+
+    return (
+        "Upload received.\n"
+        f"Files received: {file_count}\n"
+        f"Images: {image_count}\n"
+        f"Captions: {caption_count}\n"
+        f"Other files ignored on import: {other_count}\n"
+        f"Uploaded size: {format_bytes(total_size)}\n\n"
+        "Ready to import."
+    )
+
+
+def copy_uploaded_files(file_values, target_dir: Path, progress: gr.Progress | None = None) -> int:
     """Copy uploaded image/caption files into a flat dataset directory."""
     target_dir.mkdir(parents=True, exist_ok=True)
     copied = 0
     allowed_exts = IMAGE_EXTS | {".txt"}
+    uploaded = uploaded_file_paths(file_values)
 
-    for src in uploaded_file_paths(file_values):
+    for index, src in enumerate(uploaded, start=1):
+        if progress:
+            progress((index - 1) / max(len(uploaded), 1), desc=f"Copying {src.name}")
         if not src.is_file() or src.suffix.lower() not in allowed_exts:
             continue
         dest = target_dir / src.name
@@ -269,15 +332,21 @@ def copy_uploaded_files(file_values, target_dir: Path) -> int:
         shutil.copy2(src, dest)
         copied += 1
 
+    if progress:
+        progress(1.0, desc="File import complete")
+
     return copied
 
 
-def safe_extract_zip(zip_path: Path, target_dir: Path) -> int:
+def safe_extract_zip(zip_path: Path, target_dir: Path, progress: gr.Progress | None = None) -> int:
     """Extract a zip while blocking absolute paths and parent traversal."""
     extracted = 0
     target_dir.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_path) as zf:
-        for info in zf.infolist():
+        infos = zf.infolist()
+        for index, info in enumerate(infos, start=1):
+            if progress:
+                progress((index - 1) / max(len(infos), 1), desc=f"Extracting {Path(info.filename).name or info.filename}")
             if info.is_dir():
                 continue
             normalized = info.filename.replace("\\", "/")
@@ -296,6 +365,8 @@ def safe_extract_zip(zip_path: Path, target_dir: Path) -> int:
             with zf.open(info) as src, open(dest, "wb") as out:
                 shutil.copyfileobj(src, out)
             extracted += 1
+    if progress:
+        progress(1.0, desc="ZIP import complete")
     return extracted
 
 
@@ -355,7 +426,7 @@ def create_cloud_paths(project_name: str) -> tuple[str, str, str]:
     return str(dataset_dir), str(output_dir), status
 
 
-def import_dataset_zip(project_name: str, zip_file):
+def import_dataset_zip(project_name: str, zip_file, progress=gr.Progress()):
     zip_path = uploaded_file_path(zip_file)
     if not zip_path or not zip_path.exists():
         return gr.update(), gr.update(), "Upload a .zip file first."
@@ -364,7 +435,8 @@ def import_dataset_zip(project_name: str, zip_file):
 
     dataset_dir = create_unique_dataset_dir(project_name)
     output_dir = default_output_dir(project_name)
-    extracted = safe_extract_zip(zip_path, dataset_dir)
+    progress(0, desc="Starting ZIP import")
+    extracted = safe_extract_zip(zip_path, dataset_dir, progress)
     if extracted == 0:
         return gr.update(), gr.update(), "The .zip did not contain usable files."
 
@@ -373,14 +445,15 @@ def import_dataset_zip(project_name: str, zip_file):
     return str(scanned_dir), str(output_dir), status
 
 
-def import_dataset_files(project_name: str, files):
+def import_dataset_files(project_name: str, files, progress=gr.Progress()):
     uploaded = uploaded_file_paths(files)
     if not uploaded:
         return gr.update(), gr.update(), "Upload files or a folder first."
 
     dataset_dir = create_unique_dataset_dir(project_name)
     output_dir = default_output_dir(project_name)
-    copied = copy_uploaded_files(uploaded, dataset_dir)
+    progress(0, desc="Starting file import")
+    copied = copy_uploaded_files(uploaded, dataset_dir, progress)
     if copied == 0:
         return gr.update(), gr.update(), "No supported image or .txt files were uploaded."
 
@@ -1373,6 +1446,18 @@ def build_ui() -> gr.Blocks:
             outputs=[image_directory, output_directory, cloud_status],
         )
 
+        dataset_zip.change(
+            fn=summarize_uploaded_zip,
+            inputs=[dataset_zip],
+            outputs=[cloud_status],
+        )
+
+        dataset_files.change(
+            fn=summarize_uploaded_files,
+            inputs=[dataset_files],
+            outputs=[cloud_status],
+        )
+
         import_zip_btn.click(
             fn=import_dataset_zip,
             inputs=[project_name, dataset_zip],
@@ -1431,6 +1516,7 @@ def build_ui() -> gr.Blocks:
 
 if __name__ == "__main__":
     demo = build_ui()
+    demo.queue()
     demo.launch(
         server_name=os.environ.get("GRADIO_SERVER_NAME", "127.0.0.1"),
         server_port=int(os.environ.get("GRADIO_SERVER_PORT", "7860")),
