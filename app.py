@@ -1042,6 +1042,35 @@ def refresh_training_log() -> tuple[str, str]:
     return training_status_message(state), read_log_tail(state.get("log_file") if state else None)
 
 
+def startup_training_log() -> str:
+    state = load_job_state()
+    return read_log_tail(state.get("log_file") if state else None)
+
+
+def startup_cloud_status() -> str:
+    cfg = load_config()
+    lines = []
+    image_dir = cfg.get("image_directory", "")
+    output_dir = cfg.get("output_directory", "")
+    if image_dir or output_dir:
+        lines.append("Saved paths loaded.")
+        if image_dir:
+            lines.append(f"Image Directory: {image_dir}")
+        if output_dir:
+            lines.append(f"Output Directory: {output_dir}")
+
+    state = load_job_state()
+    if state:
+        if lines:
+            lines.append("")
+        lines.append("Last background job:")
+        lines.append(f"Project: {state.get('project_name', '')}")
+        lines.append(f"Log file: {state.get('log_file', '')}")
+        lines.append(f"Output directory: {state.get('output_directory', '')}")
+
+    return "\n".join(lines)
+
+
 def stop_training() -> tuple[str, str]:
     state = load_job_state()
     pid = state.get("pid") if state else None
@@ -1218,6 +1247,7 @@ def build_ui() -> gr.Blocks:
                     interactive=False,
                     show_copy_button=True,
                     autoscroll=True,
+                    value=startup_training_log(),
                 )
 
             # ================================================================
@@ -1257,6 +1287,7 @@ def build_ui() -> gr.Blocks:
                     lines=12,
                     interactive=False,
                     show_copy_button=True,
+                    value=startup_cloud_status(),
                 )
 
                 with gr.Group():
@@ -1503,6 +1534,12 @@ def build_ui() -> gr.Blocks:
 
         stop_train_btn.click(
             fn=stop_training,
+            inputs=[],
+            outputs=[job_status_box, log_box],
+        )
+
+        demo.load(
+            fn=refresh_training_log,
             inputs=[],
             outputs=[job_status_box, log_box],
         )
